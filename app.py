@@ -34,11 +34,36 @@ EDITOR_MAX_ROWS = 1500            # rows shown in the editable grid at once
 # Database
 # ----------------------------
 
+def init_db(conn: sqlite3.Connection):
+    """Guarantees tables exist directly on the active connection without caching."""
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cvt_runs (
+            run_id TEXT NOT NULL,
+            timestamp_ms INTEGER NOT NULL,
+            primary_rpm REAL,
+            secondary_rpm REAL,
+            cvt_ratio REAL,
+            manual_mph REAL,
+            PRIMARY KEY (run_id, timestamp_ms)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runs (
+            run_id TEXT PRIMARY KEY,
+            lap_time TEXT,
+            gps_max_mph REAL,
+            notes TEXT
+        )
+    """)
+
+
 @contextmanager
 def db():
     """Short-lived connection per call: safe across Streamlit sessions/threads."""
     conn = sqlite3.connect(DB_PATH, timeout=30)
     try:
+        init_db(conn)
         yield conn
         conn.commit()
     except Exception:
@@ -46,36 +71,6 @@ def db():
         raise
     finally:
         conn.close()
-
-
-@st.cache_resource
-def init_db() -> bool:
-    with db() as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS cvt_runs (
-                run_id TEXT NOT NULL,
-                timestamp_ms INTEGER NOT NULL,
-                primary_rpm REAL,
-                secondary_rpm REAL,
-                cvt_ratio REAL,
-                manual_mph REAL,
-                PRIMARY KEY (run_id, timestamp_ms)
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS runs (
-                run_id TEXT PRIMARY KEY,
-                lap_time TEXT,
-                gps_max_mph REAL,
-                notes TEXT
-            )
-        """)
-    return True
-
-
-# Ensure tables exist immediately on script execution
-init_db()
 
 
 @st.cache_data(ttl=60)

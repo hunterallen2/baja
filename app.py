@@ -9,11 +9,16 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-DB_PATH = "gokart_telemetry.db"
+# Global SQLite database configuration
+DB_PATH = "suubaja.db"
 
-# CSV columns the Arduino must write. cvt_ratio is optional; we recompute it anyway.
-REQUIRED_IMPORT_COLUMNS = ["timestamp_ms", "primary_rpm", "secondary_rpm"]
-OPTIONAL_IMPORT_COLUMNS = ["cvt_ratio"]
+# Column Alias Definitions (maps various log formats to canonical database columns)
+COLUMN_ALIASES = {
+    "timestamp_ms": ["timestamp_ms", "time(s)", "time_s", "time", "timestamp"],
+    "primary_rpm": ["primary_rpm", "rpm_averaged", "rpm_original", "rpm", "engine_rpm"],
+    "secondary_rpm": ["secondary_rpm", "rpm_rawgap", "secondary_rpm_val", "sec_rpm"],
+    "cvt_ratio": ["cvt_ratio", "ratio"]
+}
 
 # ---- Tuning knobs (adjust to your engine / clutches) ----
 RPM_MIN, RPM_MAX = 0, 20000       # hard sensor limits
@@ -153,43 +158,80 @@ def run_id_exists(run_id: str) -> bool:
 
 
 # ----------------------------
-# Import
+# Flexible Import Function
 # ----------------------------
 
 def import_sd_csv(uploaded_file, run_id: str) -> tuple[int, int, int, str | None]:
-    """Returns (inserted, duplicates_ignored, malformed_skipped, error)."""
+    """Imports raw CSV files with automatic header mapping for DATA02.CSV format."""
     try:
         raw = pd.read_csv(io.BytesIO(uploaded_file.getvalue()), skipinitialspace=True)
     except Exception as e:
         return 0, 0, 0, f"Couldn't read CSV: {e}"
 
     raw.columns = [str(c).strip().lower() for c in raw.columns]
-    missing = [c for c in REQUIRED_IMPORT_COLUMNS if c not in raw.columns]
-    if missing:
-        return 0, 0, 0, (
-            f"CSV is missing columns: {', '.join(missing)}. "
-            f"Found: {', '.join(raw.columns) or 'none'}"
-        )
 
-    cols = REQUIRED_IMPORT_COLUMNS + [c for c in OPTIONAL_IMPORT_COLUMNS if c in raw.columns]
-    df = raw[cols].copy()
-    before = len(df)
+    mapped_df = pd.DataFrame()
 
-    # Coerce everything to numbers. Repeated header lines (logger restarts),
-    # half-written final lines, and garbage all become NaN and get dropped.
-    for c in cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=REQUIRED_IMPORT_COLUMNS)
+    # 1. Map Time / Timestamp
+    found_time_col = None
+    for alias in COLUMN_ALIASES["timestamp_ms"]:
+        if alias in raw.columns:
+            found_time_col = alias
+            break
+
+    if not found_time_col:
+        return 0, 0, 0, f"CSV missing time column. Supported: {COLUMN_ALIASES['timestamp_ms']}. Found: {list(raw.columns)}"
+
+    time_vals = pd.to_numeric(raw[found_time_col], errors="coerce")
+    if found_time_col in ["time(s)", "time_s", "time"]:
+        mapped_df["timestamp_ms"] = (time_vals * 1000).astype("float64")
+    else:
+        mapped_df["timestamp_ms"] = time_vals
+
+    # 2. Map Primary RPM
+    found_primary_col = None
+    for alias in COLUMN_ALIASES["primary_rpm"]:
+        if alias in raw.columns:
+            found_primary_col = alias
+            break
+
+    if not found_primary_col:
+        return 0, 0, 0, f"CSV missing RPM column. Supported: {COLUMN_ALIASES['primary_rpm']}. Found: {list(raw.columns)}"
+
+    mapped_df["primary_rpm"] = pd.to_numeric(raw[found_primary_col], errors="coerce")
+
+    # 3. Map Secondary RPM
+    found_secondary_col = None
+    for alias in COLUMN_ALIASES["secondary_rpm"]:
+        if alias in raw.columns:
+            found_secondary_col = alias
+            break
+
+    if found_secondary_col:
+        mapped_df["secondary_rpm"] = pd.to_numeric(raw[found_secondary_col], errors="coerce")
+    else:
+        mapped_df["secondary_rpm"] = 0.0
+
+    # 4. Map CVT Ratio if present
+    found_ratio_col = None
+    for alias in COLUMN_ALIASES["cvt_ratio"]:
+        if alias in raw.columns:
+            found_ratio_col = alias
+            break
+
+    if found_ratio_col:
+        mapped_df["cvt_ratio"] = pd.to_numeric(raw[found_ratio_col], errors="coerce")
+    else:
+        mapped_df["cvt_ratio"] = np.nan
+
+    before = len(mapped_df)
+    df = mapped_df.dropna(subset=["timestamp_ms", "primary_rpm"])
     df = df[(df["timestamp_ms"] >= 0) & np.isfinite(df["timestamp_ms"])]
     skipped = before - len(df)
 
     if df.empty:
-        return 0, 0, skipped, "No valid rows found in this file."
+        return 0, 0, skipped, "No valid telemetry rows found in this file."
 
-    if "cvt_ratio" not in df.columns:
-        df["cvt_ratio"] = np.nan
-
-    # Same timestamp twice within the file: keep the first
     df["timestamp_ms"] = df["timestamp_ms"].astype("int64")
     df = df.drop_duplicates(subset="timestamp_ms", keep="first")
 
@@ -234,14 +276,11 @@ def clean_run_df(run_df: pd.DataFrame, smooth: bool) -> tuple[pd.DataFrame, dict
     for c in ["timestamp_ms", "primary_rpm", "secondary_rpm", "cvt_ratio", "manual_mph"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df = df.dropna(subset=["timestamp_ms", "primary_rpm", "secondary_rpm"])
+    df = df.dropna(subset=["timestamp_ms", "primary_rpm"])
     df = df.sort_values("timestamp_ms").drop_duplicates("timestamp_ms").reset_index(drop=True)
 
     n = len(df)
-    in_range = (
-        df["primary_rpm"].between(RPM_MIN, RPM_MAX)
-        & df["secondary_rpm"].between(RPM_MIN, RPM_MAX)
-    )
+    in_range = df["primary_rpm"].between(RPM_MIN, RPM_MAX)
     df = df[in_range].reset_index(drop=True)
     stats["out_of_range"] = n - len(df)
 
@@ -249,23 +288,21 @@ def clean_run_df(run_df: pd.DataFrame, smooth: bool) -> tuple[pd.DataFrame, dict
     n = len(df)
     if n >= 5:
         keep = pd.Series(True, index=df.index)
-        for col in ["primary_rpm", "secondary_rpm"]:
-            med = df[col].rolling(SMOOTH_WINDOW, center=True, min_periods=1).median()
-            keep &= (df[col] - med).abs() <= SPIKE_RPM_THRESHOLD
+        med = df["primary_rpm"].rolling(SMOOTH_WINDOW, center=True, min_periods=1).median()
+        keep &= (df["primary_rpm"] - med).abs() <= SPIKE_RPM_THRESHOLD
         df = df[keep].reset_index(drop=True)
     stats["spikes"] = n - len(df)
 
     if df.empty:
         return df, stats
 
-    # Arduino millis() counts from power-on, so use elapsed time, not a calendar date
     df["elapsed_s"] = (df["timestamp_ms"] - df["timestamp_ms"].iloc[0]) / 1000.0
 
     if smooth:
         for col in ["primary_rpm", "secondary_rpm"]:
             df[col] = df[col].rolling(SMOOTH_WINDOW, center=True, min_periods=1).median()
 
-    # Ratio is only meaningful when the secondary is actually turning
+    # Ratio calculation
     valid = df["secondary_rpm"] >= MIN_SECONDARY_RPM
     ratio = (df["primary_rpm"] / df["secondary_rpm"].where(valid)).astype(float)
     df["computed_cvt_ratio"] = ratio.where(ratio.between(RATIO_MIN, RATIO_MAX))
@@ -309,13 +346,7 @@ st.title("🏎️ SUU Baja Go-Kart Telemetry Dashboard")
 
 # ---- CSV import ----
 with st.expander("📥 Import Telemetry CSV Log", expanded=not fetch_run_ids()):
-    st.caption(
-        "Upload the CSV from the SD card. Required columns: "
-        + ", ".join(REQUIRED_IMPORT_COLUMNS)
-        + ". Optional: "
-        + ", ".join(OPTIONAL_IMPORT_COLUMNS)
-        + "."
-    )
+    st.caption("Supports standard Arduino logs (`timestamp_ms`, `primary_rpm`) and DATA02 style logs (`Time(s)`, `RPM_Averaged`, `RPM_RawGap`).")
     uploaded_file = st.file_uploader("CSV log file", type=["csv"], key="sd_upload")
 
     default_run_name = datetime.now().strftime("run_%Y-%m-%d_%H%M")
@@ -484,7 +515,10 @@ if len(plot_df) < len(run_df):
 chart_col1, chart_col2 = st.columns(2)
 with chart_col1:
     st.subheader("Engine vs. Secondary RPM")
-    st.line_chart(plot_df, x="elapsed_s", y=["primary_rpm", "secondary_rpm"],
+    active_rpm_cols = ["primary_rpm"]
+    if (plot_df["secondary_rpm"] > 0).any():
+        active_rpm_cols.append("secondary_rpm")
+    st.line_chart(plot_df, x="elapsed_s", y=active_rpm_cols,
                   x_label="Elapsed time (s)", y_label="RPM")
 
 with chart_col2:
@@ -497,7 +531,7 @@ with chart_col2:
         st.caption(f"Ratio shown only when secondary RPM ≥ {MIN_SECONDARY_RPM} "
                    f"and between {RATIO_MIN} and {RATIO_MAX}.")
     else:
-        st.info("No valid ratio data for this run.")
+        st.info("No secondary shaft sensors connected for ratio calculation.")
 
 st.divider()
 st.subheader("CVT Tuning Curve (Primary RPM vs. Shift Ratio)")

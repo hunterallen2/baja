@@ -74,14 +74,19 @@ def init_db() -> bool:
     return True
 
 
+# Ensure tables exist immediately on script execution
 init_db()
 
 
 @st.cache_data(ttl=60)
 def fetch_run_ids() -> list[str]:
-    with db() as conn:
-        df = pd.read_sql("SELECT DISTINCT run_id FROM cvt_runs ORDER BY run_id", conn)
-    return df["run_id"].tolist()
+    """Safe retrieval of run IDs; prevents startup crashes on empty/new databases."""
+    try:
+        with db() as conn:
+            df = pd.read_sql("SELECT DISTINCT run_id FROM cvt_runs ORDER BY run_id", conn)
+        return df["run_id"].tolist()
+    except Exception:
+        return []
 
 
 @st.cache_data(ttl=10)
@@ -151,10 +156,13 @@ def save_manual_mph(run_id: str, changes: list[tuple]) -> int:
 
 
 def run_id_exists(run_id: str) -> bool:
-    with db() as conn:
-        return conn.execute(
-            "SELECT 1 FROM cvt_runs WHERE run_id = ? LIMIT 1", (run_id,)
-        ).fetchone() is not None
+    try:
+        with db() as conn:
+            return conn.execute(
+                "SELECT 1 FROM cvt_runs WHERE run_id = ? LIMIT 1", (run_id,)
+            ).fetchone() is not None
+    except sqlite3.Error:
+        return False
 
 
 # ----------------------------

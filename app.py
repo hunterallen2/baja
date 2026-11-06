@@ -1,16 +1,23 @@
+import base64
 import io
 import math
+import os
 import re
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
 # Global SQLite database configuration
 DB_PATH = "suubaja.db"
+
+# GitHub backup configuration (token + repo come from Streamlit Secrets)
+GH_PATH = "suubaja.db"
 
 # Column Alias Definitions (maps various log formats to canonical database columns)
 COLUMN_ALIASES = {
@@ -158,6 +165,99 @@ def run_id_exists(run_id: str) -> bool:
             ).fetchone() is not None
     except sqlite3.Error:
         return False
+
+
+def db_is_empty() -> bool:
+    """True if the database has no telemetry rows (new, reset, or wiped)."""
+    try:
+        with db() as conn:
+            return conn.execute("SELECT 1 FROM cvt_runs LIMIT 1").fetchone() is None
+    except sqlite3.Error:
+        return True
+
+
+# ----------------------------
+# Backup (download + GitHub)
+# ----------------------------
+
+def db_backup_bytes() -> bytes:
+    """Consistent copy of the DB, including anything still in the WAL file."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "backup.db")
+        src, dst = sqlite3.connect(DB_PATH), sqlite3.connect(path)
+        src.backup(dst)
+        src.close()
+        dst.close()
+        with open(path, "rb") as f:
+            return f.read()
+
+
+def _gh():
+    """Returns (url, headers), or None if GH_TOKEN / GH_REPO aren't in Secrets."""
+    try:
+        token = st.secrets["GH_TOKEN"]
+        repo = st.secrets["GH_REPO"]
+    except Exception:
+        return None
+    url = f"https://api.github.com/repos/{repo}/contents/{GH_PATH}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+    return url, headers
+
+
+def gh_load_db() -> bool:
+    """Pull the saved database from GitHub. Returns True on success."""
+    cfg = _gh()
+    if cfg is None:
+        return False
+    url, headers = cfg
+    try:
+        raw_headers = {**headers, "Accept": "application/vnd.github.raw+json"}
+        r = requests.get(url, headers=raw_headers, timeout=30)
+        if r.status_code != 200 or not r.content.startswith(b"SQLite format 3"):
+            return False
+        tmp = DB_PATH + ".restore"
+        with open(tmp, "wb") as f:
+            f.write(r.content)
+        for suffix in ("-wal", "-shm"):
+            try:
+                os.remove(DB_PATH + suffix)
+            except FileNotFoundError:
+                pass
+        os.replace(tmp, DB_PATH)
+        return True
+    except Exception:
+        return False
+
+
+def gh_save_db() -> str | None:
+    """Push the current database to GitHub. Returns an error message, or None on success."""
+    cfg = _gh()
+    if cfg is None:
+        return "GitHub backup isn't set up (add GH_TOKEN and GH_REPO in Secrets)."
+    if db_is_empty():
+        return "Database is empty, so there is nothing to back up."
+    url, headers = cfg
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+        payload = {
+            "message": f"backup {datetime.now():%Y-%m-%d %H:%M}",
+            "content": base64.b64encode(db_backup_bytes()).decode(),
+        }
+        if r.status_code == 200:
+            payload["sha"] = r.json()["sha"]
+        r = requests.put(url, headers=headers, json=payload, timeout=60)
+        if r.status_code in (200, 201):
+            return None
+        return f"GitHub error {r.status_code}: {r.text[:200]}"
+    except Exception as e:
+        return str(e)
+
+
+def backup_note(err: str | None) -> str:
+    return " Backed up to GitHub." if err is None else f" ⚠️ GitHub backup failed: {err}"
 
 
 # ----------------------------
@@ -345,11 +445,17 @@ def estimate_shift_rpm(df: pd.DataFrame):
 # ----------------------------
 
 st.set_page_config(page_title="SUU Baja Data Dashboard", page_icon="🏎️", layout="wide")
+
+# If the app restarted and lost its local database, pull the last backup from GitHub.
+if db_is_empty():
+    if gh_load_db():
+        clear_caches()
+
 st.title("🏎️ SUU Baja Data Dashboard")
 
 # ---- CSV import ----
 with st.expander("📥 Import Telemetry CSV Log", expanded=not fetch_run_ids()):
-    st.caption("Supports standard Arduino logs (`timestamp_ms`, `primary_rpm`) and DATA02 style logs (`Time(s)`, `RPM_Averaged`, `RPM_RawGap`).")
+    st.caption("Supports standard Arduino logs (`timestamp_ms`, `primary_rpm`, `secondary_rpm`) and DATA02 style logs (`Time(s)`, `RPM_Averaged`, `RPM_RawGap`).")
     uploaded_file = st.file_uploader("CSV log file", type=["csv"], key="sd_upload")
 
     default_run_name = datetime.now().strftime("run_%Y-%m-%d_%H%M")
@@ -382,6 +488,7 @@ with st.expander("📥 Import Telemetry CSV Log", expanded=not fetch_run_ids()):
                     msg += f" {dupes} duplicate timestamp(s) ignored."
                 if skipped:
                     msg += f" {skipped} malformed row(s) skipped."
+                msg += backup_note(gh_save_db())
                 st.session_state["flash"] = msg
                 clear_caches()
                 st.rerun()
@@ -413,7 +520,7 @@ with top4:
 
 assert selected_run is not None
 
-# ---- Sidebar metadata ----
+# ---- Sidebar metadata + backup ----
 with st.sidebar:
     st.header("📝 Manual Run Metadata")
     st.caption(f"Editing metadata for: **{selected_run}**")
@@ -455,8 +562,26 @@ with st.sidebar:
                 )
                 if ok:
                     fetch_run_metadata.clear()
-                    st.session_state["flash"] = f"Saved metadata for {selected_run}."
+                    st.session_state["flash"] = (
+                        f"Saved metadata for {selected_run}." + backup_note(gh_save_db())
+                    )
                     st.rerun()
+
+    st.divider()
+    st.header("💾 Backup")
+    st.caption("Imports and saves back up to GitHub automatically. Use these for a manual copy.")
+    if st.button("☁️ Save backup to GitHub", use_container_width=True):
+        err = gh_save_db()
+        if err is None:
+            st.success("Backed up to GitHub.")
+        else:
+            st.error(err)
+    st.download_button(
+        "⬇️ Download database backup",
+        data=db_backup_bytes(),
+        file_name=f"suubaja_backup_{datetime.now():%Y-%m-%d_%H%M}.db",
+        use_container_width=True,
+    )
 
 # ---- Load + clean ----
 raw_run_df = fetch_run(selected_run)
@@ -546,6 +671,19 @@ else:
     st.scatter_chart(tuning_df, x="primary_rpm", y="computed_cvt_ratio",
                      color="secondary_rpm")
 
+# ---- Primary vs. Secondary (only when a secondary sensor was logged) ----
+if (run_df["secondary_rpm"] > 0).any():
+    st.divider()
+    st.subheader("Primary vs. Secondary RPM")
+    sec_valid = run_df[run_df["secondary_rpm"] >= MIN_SECONDARY_RPM]
+    coverage = len(sec_valid) / len(run_df) * 100
+    st.caption(f"Secondary data present on {coverage:.0f}% of samples.")
+    if sec_valid.empty:
+        st.info("Secondary RPM never reached the minimum threshold.")
+    else:
+        st.scatter_chart(downsample(sec_valid), x="primary_rpm", y="secondary_rpm",
+                         color="elapsed_s")
+
 # ---- Run comparison ----
 if compare_runs:
     st.divider()
@@ -605,7 +743,7 @@ with st.expander("📋 Interactive Data Grid (Manual In-Line Edits)"):
         n = save_manual_mph(selected_run, changes)
         if n:
             fetch_run.clear()
-            st.session_state["flash"] = f"Saved {n} row edit(s)."
+            st.session_state["flash"] = f"Saved {n} row edit(s)." + backup_note(gh_save_db())
             st.rerun()
         else:
             st.info("No changes to save.")

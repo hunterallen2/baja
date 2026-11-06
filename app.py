@@ -344,8 +344,8 @@ def estimate_shift_rpm(df: pd.DataFrame):
 # UI
 # ----------------------------
 
-st.set_page_config(page_title="SUU Baja Telemetry", page_icon="🏎️", layout="wide")
-st.title("🏎️ SUU Baja Go-Kart Telemetry Dashboard")
+st.set_page_config(page_title="SUU Baja Data Dashboard", page_icon="🏎️", layout="wide")
+st.title("🏎️ SUU Baja Data Dashboard")
 
 # ---- CSV import ----
 with st.expander("📥 Import Telemetry CSV Log", expanded=not fetch_run_ids()):
